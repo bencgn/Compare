@@ -1,4 +1,4 @@
-﻿// FolderCompare.cpp v3.0
+﻿// FolderCompare.cpp v3.1
 // Copyright (c) 2026 bencgn - https://github.com/bencgn/Compare
 // Licensed under the MIT License (see LICENSE)
 // NEW: Tree expand/collapse | Config persistence | Drag & Drop from Explorer
@@ -2816,7 +2816,7 @@ void BuildControls(HWND h) {
 
     // Initial log
     wchar_t user[128]={}; DWORD ul=128; GetUserNameW(user,&ul);
-    AddLog(std::wstring(L"FolderCompare v3.0  |  ") + user);
+    AddLog(std::wstring(L"FolderCompare v3.1  |  ") + user);
     AddLog(L"© 2026 bencgn  |  github.com/bencgn/Compare");
     AddLog(L"Tip: Click \u25b6 icon to expand folder  |  Drag folder from Explorer to set path");
     AddLog(L"Filter: *.cpp;*.h includes,  -*.ini* excludes");
@@ -3455,7 +3455,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_TB_ABOUT:
         case ID_HELP_ABOUT:
             MessageBoxW(h,
-                L"FolderCompare  v3.0\r\n"
+                L"FolderCompare  v3.1\r\n"
                 L"Made by bencgn\r\n\r\n"
                 L"NEW in v3.0:\r\n"
                 L"  \u25b6/\u25bc  Click folder ICON to expand/collapse tree\r\n"
@@ -3473,7 +3473,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 L"  Ctrl+A      Select all\r\n\r\n"
                 L"Colours:\r\n"
                 L"  Red text=Newer / only on this side  Yellow text=Older different  White text=Same",
-                L"About FolderCompare v3.0", MB_OK|MB_ICONINFORMATION);
+                L"About FolderCompare v3.1", MB_OK|MB_ICONINFORMATION);
             break;
         }
         break;
@@ -3689,7 +3689,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show) {
     RegisterClassExW(&wcp);
 
     g_wnd = CreateWindowExW(0, L"FolderCompareWnd",
-        L"FolderCompare v3.0 - Folder Comparison Tool  |  by bencgn",
+        L"FolderCompare v3.1 - Folder Comparison Tool  |  by bencgn",
         WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,1000,640,
         nullptr,nullptr,hi,nullptr);

@@ -19,10 +19,10 @@ A lightweight, dark-themed folder comparison tool for Windows, written in C++ (W
   - Scale: ×0.5, ×2, ×3, ×4
   - Longest side: 512, 1K (1024), 2K (2048), 4K (4096)
   - Aspect ratio and transparency are preserved; works on multi-selection with a progress window
-- **Rename (strip suffix)** — works on any selected file, extension is kept
-  - Cut from the last `_`, `-` or space: `logo_1024.png` → `logo.png`
-  - Remove the last 1–8 characters of the name
-  - Skips files whose target name already exists
+- **Rename...** — a floating tool window (3ds Max style) that stays open between renames
+  - Base Name, Prefix, Suffix, Remove First / Last N characters, Numbered (base number + step)
+  - Live preview; select other files in the main window and click Rename again
+  - Extension is kept; files whose target name already exists are skipped
 
 > Note: very large images are limited by GDI+ (output up to ~2 GB of pixels, i.e. roughly 22k × 22k).
 
