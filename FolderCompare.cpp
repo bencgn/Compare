@@ -127,12 +127,7 @@ namespace fs = std::filesystem;
 #define ID_CTX_RS_1024      521
 #define ID_CTX_RS_2048      522
 #define ID_CTX_RS_4096      523
-// Rename: strip suffix. 530.. = cut from last delimiter, 541..548 = remove last N chars (N = id-540)
-#define ID_CTX_RN_UNDERSCORE 530
-#define ID_CTX_RN_DASH       531
-#define ID_CTX_RN_SPACE      532
-#define ID_CTX_RN_N_FIRST    541
-#define ID_CTX_RN_N_LAST     548
+#define ID_CTX_RENAME       530
 
 // Layout
 #define TB_H        30
@@ -354,7 +349,7 @@ void DeleteSelected(bool fromLeft);
 void OpenInExplorer(bool left, int idx);
 void OpenFile(bool left, int idx);
 void ResizeSelectedPng(bool left, double scale, int longest);
-void RenameStripSuffix(bool left, wchar_t delim, int nChars);
+void ShowRenameDialog(bool left);
 void SyncRowSel(HWND src, int idx);
 void UpdateStatusSel();
 void SaveConfig();
@@ -1803,11 +1798,145 @@ void ResizeSelectedPng(bool left, double scale, int longest) {
 }
 
 // ===================================================================
-// Rename: strip a suffix from the base name (extension is kept).
-//   delim != 0  -> cut from the last delimiter:  logo_1024.png -> logo.png
-//   nChars > 0  -> drop the last N characters:   logo_1024.png (N=5) -> logo.png
+// Rename dialog (3ds Max style):
+//   [Prefix] + (Base Name | original name minus first/last N chars) + [Suffix] + [Number]
+// Extension is always kept. Applies to the selected files of one side.
 // ===================================================================
-void RenameStripSuffix(bool left, wchar_t delim, int nChars) {
+struct RnOpts {
+    bool useBase = false, usePrefix = false, useRemFirst = false;
+    bool useSuffix = false, useRemLast = false, numbered = false;
+    std::wstring base, prefix, suffix;
+    int remFirst = 0, remLast = 0, baseNum = 0, step = 1;
+};
+
+static std::wstring RnBuildName(const std::wstring& stem, const RnOpts& o, int i, int total) {
+    std::wstring s = stem;
+    if (o.useBase && !o.base.empty()) {
+        s = o.base;
+    } else {
+        if (o.useRemFirst) s = (int)s.size() > o.remFirst ? s.substr(o.remFirst) : L"";
+        if (o.useRemLast)  s = (int)s.size() > o.remLast  ? s.substr(0, s.size() - o.remLast) : L"";
+    }
+    if (o.usePrefix) s = o.prefix + s;
+    if (o.useSuffix) s += o.suffix;
+    if (o.numbered) {
+        long long first = o.baseNum, last = (long long)o.baseNum + (long long)(total > 0 ? total - 1 : 0) * o.step;
+        long long mx = first > last ? first : last;
+        int width = 2;
+        for (long long t = mx; t >= 100; t /= 10) width++;
+        wchar_t nb[40];
+        swprintf(nb, 40, L"%0*lld", width, (long long)o.baseNum + (long long)i * o.step);
+        s += nb;
+    }
+    return s;
+}
+
+static void RnSplit(const std::wstring& path, std::wstring& dir, std::wstring& stem, std::wstring& ext) {
+    size_t sl = path.find_last_of(L"\\/");
+    dir = path.substr(0, sl == std::wstring::npos ? 0 : sl + 1);
+    std::wstring name = path.substr(dir.size());
+    size_t dot = name.find_last_of(L'.');
+    stem = (dot == std::wstring::npos || dot == 0) ? name : name.substr(0, dot);
+    ext  = name.substr(stem.size());
+}
+
+enum { RN_BASE_CK = 7001, RN_BASE_ED, RN_PRE_CK, RN_PRE_ED, RN_RF_CK, RN_RF_ED, RN_RF_UD,
+       RN_SUF_CK, RN_SUF_ED, RN_RL_CK, RN_RL_ED, RN_RL_UD, RN_NUM_CK,
+       RN_BN_ED, RN_BN_UD, RN_ST_ED, RN_ST_UD, RN_PREVIEW };
+
+struct RnDlg {
+    HWND wnd = nullptr;
+    const std::vector<std::wstring>* files = nullptr;
+    bool done = false, ok = false;
+    RnOpts opts;
+};
+
+static std::wstring RnGetText(HWND dlg, int id) {
+    wchar_t b[512] = {};
+    GetDlgItemTextW(dlg, id, b, 512);
+    return b;
+}
+static int RnGetInt(HWND dlg, int id, int lo, int hi) {
+    BOOL ok = FALSE;
+    int v = (int)GetDlgItemInt(dlg, id, &ok, FALSE);
+    if (!ok) v = lo;
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+static bool RnChecked(HWND dlg, int id) { return IsDlgButtonChecked(dlg, id) == BST_CHECKED; }
+
+static RnOpts RnReadOpts(HWND d) {
+    RnOpts o;
+    o.useBase = RnChecked(d, RN_BASE_CK);   o.base = RnGetText(d, RN_BASE_ED);
+    o.usePrefix = RnChecked(d, RN_PRE_CK);  o.prefix = RnGetText(d, RN_PRE_ED);
+    o.useSuffix = RnChecked(d, RN_SUF_CK);  o.suffix = RnGetText(d, RN_SUF_ED);
+    o.useRemFirst = RnChecked(d, RN_RF_CK); o.remFirst = RnGetInt(d, RN_RF_ED, 0, 99);
+    o.useRemLast = RnChecked(d, RN_RL_CK);  o.remLast = RnGetInt(d, RN_RL_ED, 0, 99);
+    o.numbered = RnChecked(d, RN_NUM_CK);
+    o.baseNum = RnGetInt(d, RN_BN_ED, 0, 999999);
+    o.step = RnGetInt(d, RN_ST_ED, 0, 9999);
+    return o;
+}
+
+static void RnRefresh(HWND d, RnDlg* st) {
+    struct { int ck, ed, ud; } rows[] = {
+        {RN_BASE_CK, RN_BASE_ED, 0}, {RN_PRE_CK, RN_PRE_ED, 0}, {RN_RF_CK, RN_RF_ED, RN_RF_UD},
+        {RN_SUF_CK, RN_SUF_ED, 0},   {RN_RL_CK, RN_RL_ED, RN_RL_UD} };
+    for (auto& r : rows) {
+        BOOL en = RnChecked(d, r.ck);
+        EnableWindow(GetDlgItem(d, r.ed), en);
+        if (r.ud) EnableWindow(GetDlgItem(d, r.ud), en);
+    }
+    BOOL num = RnChecked(d, RN_NUM_CK);
+    for (int id : { RN_BN_ED, RN_BN_UD, RN_ST_ED, RN_ST_UD }) EnableWindow(GetDlgItem(d, id), num);
+
+    RnOpts o = RnReadOpts(d);
+    std::wstring txt;
+    int total = (int)st->files->size();
+    for (int i = 0; i < total && i < 3; i++) {
+        std::wstring dir, stem, ext;
+        RnSplit((*st->files)[i], dir, stem, ext);
+        txt += stem + ext + L"  →  " + RnBuildName(stem, o, i, total) + ext + L"\r\n";
+    }
+    if (total > 3) { wchar_t m[48]; swprintf(m, 48, L"... (%d files)", total); txt += m; }
+    SetDlgItemTextW(d, RN_PREVIEW, txt.c_str());
+}
+
+static LRESULT CALLBACK RenameDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    RnDlg* st = (RnDlg*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams);
+        break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORBTN: {
+        HDC dc = (HDC)wp; HWND c = (HWND)lp;
+        bool en = IsWindowEnabled(c) != 0;
+        SetTextColor(dc, en ? CLR_TEXT : CLR_MUTED);
+        SetBkMode(dc, OPAQUE);
+        if (msg == WM_CTLCOLOREDIT) {
+            SetBkColor(dc, CLR_EDIT);
+            return (LRESULT)(g_brEdit ? g_brEdit : GetStockObject(BLACK_BRUSH));
+        }
+        SetBkColor(dc, CLR_BG);
+        return (LRESULT)(g_brBg ? g_brBg : GetStockObject(BLACK_BRUSH));
+    }
+    case WM_COMMAND: {
+        if (!st) break;
+        int id = LOWORD(wp), code = HIWORD(wp);
+        if (id == IDOK)     { st->opts = RnReadOpts(h); st->ok = true; st->done = true; return 0; }
+        if (id == IDCANCEL) { st->done = true; return 0; }
+        if (code == BN_CLICKED || code == EN_CHANGE) RnRefresh(h, st);
+        return 0;
+    }
+    case WM_CLOSE:
+        if (st) st->done = true;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowRenameDialog(bool left) {
     HWND lv = left ? g_llist : g_rlist;
     std::vector<std::wstring> files;
     int idx = -1;
@@ -1815,42 +1944,120 @@ void RenameStripSuffix(bool left, wchar_t delim, int nChars) {
         if (idx >= (int)g_vis.size()) break;
         CmpNode* n = g_vis[idx];
         if (n->isDir) continue;
-        std::wstring path = left ? n->leftFullPath() : n->rightFullPath();
-        if (!path.empty()) files.push_back(path);
+        std::wstring p = left ? n->leftFullPath() : n->rightFullPath();
+        if (!p.empty()) files.push_back(p);
     }
-    if (files.empty()) return;
+    if (files.empty()) { MessageBoxW(g_wnd, L"Select one or more files first.", L"Rename", MB_OK | MB_ICONINFORMATION); return; }
 
-    int ok = 0, skip = 0;
-    for (auto& path : files) {
-        size_t sl = path.find_last_of(L"\\/");
-        std::wstring dir  = path.substr(0, sl == std::wstring::npos ? 0 : sl + 1);
-        std::wstring name = path.substr(dir.size());
-        size_t dot = name.find_last_of(L'.');
-        std::wstring stem = (dot == std::wstring::npos || dot == 0) ? name : name.substr(0, dot);
-        std::wstring ext  = name.substr(stem.size());
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = RenameDlgProc; wc.hInstance = g_inst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_brBg ? g_brBg : (HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName = L"FCRenameDlg";
+        RegisterClassExW(&wc); reg = true;
+    }
+    RnDlg st; st.files = &files;
+    const int W = 310, H = 404;
+    RECT pr; GetWindowRect(g_wnd, &pr);
+    RECT rc = {0, 0, W, H};
+    AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU | WS_POPUP, FALSE);
+    int ww = rc.right - rc.left, hh = rc.bottom - rc.top;
+    HWND d = CreateWindowExW(WS_EX_DLGMODALFRAME, L"FCRenameDlg", L"Rename Files",
+        WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
+        (pr.left + pr.right - ww) / 2, (pr.top + pr.bottom - hh) / 2, ww, hh,
+        g_wnd, nullptr, g_inst, &st);
+    if (!d) return;
+    st.wnd = d;
+    ApplyImmersiveDarkMode(d);
+    HFONT f = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-        std::wstring ns;
-        if (delim) {
-            size_t p = stem.find_last_of(delim);
-            if (p == std::wstring::npos || p == 0) { skip++; AddLog(L"Rename skipped (no '" + std::wstring(1, delim) + L"'): " + name); continue; }
-            ns = stem.substr(0, p);
-        } else {
-            if ((int)stem.size() <= nChars) { skip++; AddLog(L"Rename skipped (name too short): " + name); continue; }
-            ns = stem.substr(0, stem.size() - nChars);
-        }
+    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | style, x, y, w, h, d, (HMENU)(INT_PTR)id, g_inst, nullptr);
+        SendMessage(c, WM_SETFONT, (WPARAM)f, TRUE);
+        return c;
+    };
+    auto check = [&](const wchar_t* t, int y, int id) {
+        HWND c = mk(L"BUTTON", t, BS_AUTOCHECKBOX | WS_TABSTOP, 14, y, 120, 22, id);
+        SetWindowTheme(c, L"", L"");
+        return c;
+    };
+    auto edit = [&](int x, int y, int w, int id, bool num) {
+        return mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP | (num ? ES_NUMBER : 0), x, y, w, 22, id, WS_EX_CLIENTEDGE);
+    };
+    auto spin = [&](int editId, int udId, int lo, int hi, int pos) {
+        HWND u = CreateWindowExW(0, UPDOWN_CLASSW, nullptr,
+            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
+            0, 0, 0, 0, d, (HMENU)(INT_PTR)udId, g_inst, nullptr);
+        SendMessage(u, UDM_SETBUDDY, (WPARAM)GetDlgItem(d, editId), 0);
+        SendMessage(u, UDM_SETRANGE32, lo, hi);
+        SendMessage(u, UDM_SETPOS32, 0, pos);
+    };
+
+    int y = 14;
+    check(L"Base Name:", y, RN_BASE_CK); edit(140, y, 154, RN_BASE_ED, false); y += 34;
+    check(L"Prefix:",    y, RN_PRE_CK);  edit(140, y, 154, RN_PRE_ED, false);  y += 34;
+    check(L"Remove First:", y, RN_RF_CK); edit(140, y, 60, RN_RF_ED, true); spin(RN_RF_ED, RN_RF_UD, 0, 99, 0);
+    mk(L"STATIC", L"chars", 0, 208, y + 3, 80, 20, 0); y += 34;
+    check(L"Suffix:",    y, RN_SUF_CK);  edit(140, y, 154, RN_SUF_ED, false);  y += 34;
+    check(L"Remove Last:", y, RN_RL_CK);  edit(140, y, 60, RN_RL_ED, true); spin(RN_RL_ED, RN_RL_UD, 0, 99, 0);
+    mk(L"STATIC", L"chars", 0, 208, y + 3, 80, 20, 0); y += 40;
+    check(L"Numbered", y, RN_NUM_CK); y += 28;
+    mk(L"STATIC", L"Base Number:", 0, 30, y + 3, 100, 20, 0);
+    edit(140, y, 60, RN_BN_ED, true); spin(RN_BN_ED, RN_BN_UD, 0, 999999, 0); y += 30;
+    mk(L"STATIC", L"Step:", 0, 30, y + 3, 100, 20, 0);
+    edit(140, y, 60, RN_ST_ED, true); spin(RN_ST_ED, RN_ST_UD, 0, 9999, 1); y += 36;
+    mk(L"STATIC", L"", SS_LEFT, 14, y, W - 28, 62, RN_PREVIEW);
+    HWND okb = mk(L"BUTTON", L"Rename", BS_DEFPUSHBUTTON | WS_TABSTOP, 14, H - 44, 180, 30, IDOK);
+    HWND cnb = mk(L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 204, H - 44, 90, 30, IDCANCEL);
+    SetWindowTheme(okb, L"DarkMode_Explorer", nullptr);
+    SetWindowTheme(cnb, L"DarkMode_Explorer", nullptr);
+    for (int id : { RN_BASE_ED, RN_PRE_ED, RN_RF_ED, RN_SUF_ED, RN_RL_ED, RN_BN_ED, RN_ST_ED })
+        SetWindowTheme(GetDlgItem(d, id), L"DarkMode_Explorer", nullptr);
+
+    CheckDlgButton(d, RN_BASE_CK, BST_CHECKED);
+    RnRefresh(d, &st);
+    SetFocus(GetDlgItem(d, RN_BASE_ED));
+
+    EnableWindow(g_wnd, FALSE);
+    MSG m;
+    while (!st.done && GetMessage(&m, nullptr, 0, 0)) {
+        if (!IsDialogMessage(d, &m)) { TranslateMessage(&m); DispatchMessage(&m); }
+    }
+    EnableWindow(g_wnd, TRUE);
+    DestroyWindow(d);
+    SetForegroundWindow(g_wnd);
+    if (!st.ok) return;
+
+    // Apply
+    const RnOpts& o = st.opts;
+    int ok_n = 0, skip = 0, total = (int)files.size();
+    std::wstring why;
+    auto note = [&](const std::wstring& s) { skip++; AddLog(s); if (skip <= 8) why += L"• " + s + L"\n"; };
+    for (int i = 0; i < total; i++) {
+        std::wstring dir, stem, ext;
+        RnSplit(files[i], dir, stem, ext);
+        std::wstring ns = RnBuildName(stem, o, i, total);
         while (!ns.empty() && (ns.back() == L' ' || ns.back() == L'.')) ns.pop_back();
-        if (ns.empty()) { skip++; AddLog(L"Rename skipped (empty name): " + name); continue; }
-
+        if (ns.empty()) { note(L"Skipped (empty name): " + stem + ext); continue; }
+        if (ns.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) { note(L"Skipped (invalid characters): " + ns + ext); continue; }
         std::wstring dst = dir + ns + ext;
-        if (GetFileAttributesW(dst.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            skip++; AddLog(L"Rename skipped (target exists): " + ns + ext); continue;
+        if (dst == files[i]) continue;   // unchanged
+        bool caseOnly = _wcsicmp(dst.c_str(), files[i].c_str()) == 0;
+        if (!caseOnly && GetFileAttributesW(dst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            note(L"Skipped (target exists): " + ns + ext); continue;
         }
-        if (MoveFileExW(path.c_str(), dst.c_str(), 0)) { ok++; AddLog(L"Renamed: " + name + L"  ->  " + ns + ext); }
-        else { skip++; AddLog(L"Rename FAILED: " + name); }
+        if (MoveFileExW(files[i].c_str(), dst.c_str(), 0)) { ok_n++; AddLog(L"Renamed: " + stem + ext + L"  ->  " + ns + ext); }
+        else note(L"Rename FAILED: " + stem + ext);
     }
-    wchar_t m[128]; swprintf(m, 128, L"Rename: %d done, %d skipped", ok, skip);
-    AddLog(m);
-    if (ok) Compare();
+    wchar_t sum[128]; swprintf(sum, 128, L"Rename: %d done, %d skipped", ok_n, skip);
+    AddLog(sum);
+    if (ok_n) Compare();
+    if (skip) {
+        std::wstring msg = std::wstring(sum) + L"\n\n" + why;
+        MessageBoxW(g_wnd, msg.c_str(), L"Rename", MB_OK | (ok_n ? MB_ICONINFORMATION : MB_ICONWARNING));
+    }
 }
 
 // ===================================================================
@@ -3360,16 +3567,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         AppendMenuW(hm,MF_STRING|(node?0:MF_GRAYED),ID_CTX_EXPLORE,L"Open in Explorer");
         if(node&&!node->isDir) AppendMenuW(hm,MF_STRING,ID_CTX_OPEN,L"Open File");
         if(node&&!node->isDir&&((isLeft&&hasL)||(!isLeft&&hasR))) {
-            HMENU rn=CreatePopupMenu();
-            AppendMenuW(rn,MF_STRING,ID_CTX_RN_UNDERSCORE,L"Cut from last  _  (underscore)");
-            AppendMenuW(rn,MF_STRING,ID_CTX_RN_DASH,      L"Cut from last  -  (dash)");
-            AppendMenuW(rn,MF_STRING,ID_CTX_RN_SPACE,     L"Cut from last space");
-            AppendMenuW(rn,MF_SEPARATOR,0,nullptr);
-            static const int ns[]={1,2,3,4,5,6,7,8};
-            for(int k:ns){ wchar_t t[48]; swprintf(t,48,L"Remove last %d character%s",k,k>1?L"s":L"");
-                AppendMenuW(rn,MF_STRING,ID_CTX_RN_N_FIRST-1+k,t); }
             AppendMenuW(hm,MF_SEPARATOR,0,nullptr);
-            AppendMenuW(hm,MF_POPUP|MF_STRING,(UINT_PTR)rn,L"Rename (strip suffix)");
+            AppendMenuW(hm,MF_STRING,ID_CTX_RENAME,L"Rename...");
         }
         if(node&&!node->isDir&&((isLeft&&hasL)||(!isLeft&&hasR))
            &&IsPngName(isLeft?node->leftEntry.name:node->rightEntry.name)) {
@@ -3398,9 +3597,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_CTX_OPEN:    OpenFile(isLeft,idx); break;
         case ID_CTX_EXPAND:  if(node) ExpandNode(node);   break;
         case ID_CTX_COLLAPSE:if(node) CollapseNode(node); break;
-        case ID_CTX_RN_UNDERSCORE: RenameStripSuffix(isLeft,L'_',0); break;
-        case ID_CTX_RN_DASH:       RenameStripSuffix(isLeft,L'-',0); break;
-        case ID_CTX_RN_SPACE:      RenameStripSuffix(isLeft,L' ',0); break;
+        case ID_CTX_RENAME:  ShowRenameDialog(isLeft); break;
         case ID_CTX_RS_X05:  ResizeSelectedPng(isLeft,0.5,0); break;
         case ID_CTX_RS_X2:   ResizeSelectedPng(isLeft,2,0);   break;
         case ID_CTX_RS_X3:   ResizeSelectedPng(isLeft,3,0);   break;
@@ -3409,9 +3606,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_CTX_RS_1024: ResizeSelectedPng(isLeft,0,1024); break;
         case ID_CTX_RS_2048: ResizeSelectedPng(isLeft,0,2048); break;
         case ID_CTX_RS_4096: ResizeSelectedPng(isLeft,0,4096); break;
-        default:
-            if(cmd>=ID_CTX_RN_N_FIRST&&cmd<=ID_CTX_RN_N_LAST) RenameStripSuffix(isLeft,0,cmd-(ID_CTX_RN_N_FIRST-1));
-            break;
         }
         break;
     }
