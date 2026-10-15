@@ -46,3 +46,7 @@ g++ FolderCompare.cpp FolderCompare.res -o FolderCompare.exe -mwindows \
 ## Configuration
 
 Settings (last paths, column widths, filter) are stored in `FolderCompare.ini` next to the executable.
+
+## Author & License
+
+Copyright (c) 2026 [bencgn](https://github.com/bencgn). Released under the [MIT License](LICENSE).

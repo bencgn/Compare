@@ -1,4 +1,6 @@
 ﻿// FolderCompare.cpp v3.0
+// Copyright (c) 2026 bencgn - https://github.com/bencgn/Compare
+// Licensed under the MIT License (see LICENSE)
 // NEW: Tree expand/collapse | Config persistence | Drag & Drop from Explorer
 // Build: C:\msys64\usr\bin\bash.exe -lc "PATH=/ucrt64/bin:$PATH && cd '/d/--App/Compare' && g++ FolderCompare.cpp -o FolderCompare.exe -mwindows -lcomctl32 -lshell32 -lole32 -std=c++17 -O2 -static-libgcc -static-libstdc++ -static"
 
@@ -2584,6 +2586,7 @@ void BuildControls(HWND h) {
     // Initial log
     wchar_t user[128]={}; DWORD ul=128; GetUserNameW(user,&ul);
     AddLog(std::wstring(L"FolderCompare v3.0  |  ") + user);
+    AddLog(L"© 2026 bencgn  |  github.com/bencgn/Compare");
     AddLog(L"Tip: Click \u25b6 icon to expand folder  |  Drag folder from Explorer to set path");
     AddLog(L"Filter: *.cpp;*.h includes,  -*.ini* excludes");
     AddLog(L"Keys: F5=Compare  Ctrl+C=Copy Path  Alt+Left=Back  Backspace=Up  Enter=Navigate  Del=Delete");
@@ -3467,7 +3470,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show) {
     RegisterClassExW(&wcp);
 
     g_wnd = CreateWindowExW(0, L"FolderCompareWnd",
-        L"FolderCompare v3.0 - Folder Comparison Tool",
+        L"FolderCompare v3.0 - Folder Comparison Tool  |  by bencgn",
         WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,1000,640,
         nullptr,nullptr,hi,nullptr);
