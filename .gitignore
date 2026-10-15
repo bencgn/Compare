@@ -1,0 +1,8 @@
+# build output
+*.exe
+*.res
+*.o
+build_errors.txt
+# local state / backups
+FolderCompare.ini
+backups/

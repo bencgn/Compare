@@ -1,0 +1,6 @@
+#include "resource.h"
+
+IDI_APP ICON "FolderCompare.ico"
+
+// Manifest
+1 24 "FolderCompare.manifest"
