@@ -350,6 +350,7 @@ void OpenInExplorer(bool left, int idx);
 void OpenFile(bool left, int idx);
 void ResizeSelectedPng(bool left, double scale, int longest);
 void ShowRenameDialog(bool left);
+void RenameDlgSelectionChanged();
 void SyncRowSel(HWND src, int idx);
 void UpdateStatusSel();
 void SaveConfig();
@@ -1798,9 +1799,10 @@ void ResizeSelectedPng(bool left, double scale, int longest) {
 }
 
 // ===================================================================
-// Rename dialog (3ds Max style):
+// Rename tool window (3ds Max style, modeless - stays open after Rename):
 //   [Prefix] + (Base Name | original name minus first/last N chars) + [Suffix] + [Number]
-// Extension is always kept. Applies to the selected files of one side.
+// Extension is always kept. Applies to the files currently selected in the
+// chosen side (Left/Right); you can change the selection and click Rename again.
 // ===================================================================
 struct RnOpts {
     bool useBase = false, usePrefix = false, useRemFirst = false;
@@ -1840,16 +1842,11 @@ static void RnSplit(const std::wstring& path, std::wstring& dir, std::wstring& s
     ext  = name.substr(stem.size());
 }
 
-enum { RN_BASE_CK = 7001, RN_BASE_ED, RN_PRE_CK, RN_PRE_ED, RN_RF_CK, RN_RF_ED, RN_RF_UD,
+enum { RN_SIDE_L = 7000, RN_SIDE_R, RN_BASE_CK, RN_BASE_ED, RN_PRE_CK, RN_PRE_ED, RN_RF_CK, RN_RF_ED, RN_RF_UD,
        RN_SUF_CK, RN_SUF_ED, RN_RL_CK, RN_RL_ED, RN_RL_UD, RN_NUM_CK,
-       RN_BN_ED, RN_BN_UD, RN_ST_ED, RN_ST_UD, RN_PREVIEW };
+       RN_BN_ED, RN_BN_UD, RN_ST_ED, RN_ST_UD, RN_PREVIEW, RN_COUNT };
 
-struct RnDlg {
-    HWND wnd = nullptr;
-    const std::vector<std::wstring>* files = nullptr;
-    bool done = false, ok = false;
-    RnOpts opts;
-};
+static HWND g_rnWnd = nullptr;   // the (single) Rename tool window, null when closed
 
 static std::wstring RnGetText(HWND dlg, int id) {
     wchar_t b[512] = {};
@@ -1877,7 +1874,24 @@ static RnOpts RnReadOpts(HWND d) {
     return o;
 }
 
-static void RnRefresh(HWND d, RnDlg* st) {
+// Files currently selected on the chosen side (folders are skipped).
+static std::vector<std::wstring> RnCollect(HWND d) {
+    std::vector<std::wstring> files;
+    if (g_scanning) return files;
+    bool left = RnChecked(d, RN_SIDE_L);
+    HWND lv = left ? g_llist : g_rlist;
+    int idx = -1;
+    while ((idx = ListView_GetNextItem(lv, idx, LVNI_SELECTED)) >= 0) {
+        if (idx >= (int)g_vis.size()) break;
+        CmpNode* n = g_vis[idx];
+        if (n->isDir) continue;
+        std::wstring p = left ? n->leftFullPath() : n->rightFullPath();
+        if (!p.empty()) files.push_back(p);
+    }
+    return files;
+}
+
+static void RnRefresh(HWND d) {
     struct { int ck, ed, ud; } rows[] = {
         {RN_BASE_CK, RN_BASE_ED, 0}, {RN_PRE_CK, RN_PRE_ED, 0}, {RN_RF_CK, RN_RF_ED, RN_RF_UD},
         {RN_SUF_CK, RN_SUF_ED, 0},   {RN_RL_CK, RN_RL_ED, RN_RL_UD} };
@@ -1890,149 +1904,36 @@ static void RnRefresh(HWND d, RnDlg* st) {
     for (int id : { RN_BN_ED, RN_BN_UD, RN_ST_ED, RN_ST_UD }) EnableWindow(GetDlgItem(d, id), num);
 
     RnOpts o = RnReadOpts(d);
+    std::vector<std::wstring> files = RnCollect(d);
+    int total = (int)files.size();
+    wchar_t cnt[64]; swprintf(cnt, 64, L"%d file(s) selected", total);
+    SetDlgItemTextW(d, RN_COUNT, cnt);
+
     std::wstring txt;
-    int total = (int)st->files->size();
     for (int i = 0; i < total && i < 3; i++) {
         std::wstring dir, stem, ext;
-        RnSplit((*st->files)[i], dir, stem, ext);
+        RnSplit(files[i], dir, stem, ext);
         txt += stem + ext + L"  →  " + RnBuildName(stem, o, i, total) + ext + L"\r\n";
     }
     if (total > 3) { wchar_t m[48]; swprintf(m, 48, L"... (%d files)", total); txt += m; }
+    if (total == 0) txt = L"Select file(s) in the main window,\r\nthen click Rename.";
     SetDlgItemTextW(d, RN_PREVIEW, txt.c_str());
 }
 
-static LRESULT CALLBACK RenameDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    RnDlg* st = (RnDlg*)GetWindowLongPtrW(h, GWLP_USERDATA);
-    switch (msg) {
-    case WM_NCCREATE:
-        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams);
-        break;
-    case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORBTN: {
-        HDC dc = (HDC)wp; HWND c = (HWND)lp;
-        bool en = IsWindowEnabled(c) != 0;
-        SetTextColor(dc, en ? CLR_TEXT : CLR_MUTED);
-        SetBkMode(dc, OPAQUE);
-        if (msg == WM_CTLCOLOREDIT) {
-            SetBkColor(dc, CLR_EDIT);
-            return (LRESULT)(g_brEdit ? g_brEdit : GetStockObject(BLACK_BRUSH));
-        }
-        SetBkColor(dc, CLR_BG);
-        return (LRESULT)(g_brBg ? g_brBg : GetStockObject(BLACK_BRUSH));
-    }
-    case WM_COMMAND: {
-        if (!st) break;
-        int id = LOWORD(wp), code = HIWORD(wp);
-        if (id == IDOK)     { st->opts = RnReadOpts(h); st->ok = true; st->done = true; return 0; }
-        if (id == IDCANCEL) { st->done = true; return 0; }
-        if (code == BN_CLICKED || code == EN_CHANGE) RnRefresh(h, st);
-        return 0;
-    }
-    case WM_CLOSE:
-        if (st) st->done = true;
-        return 0;
-    }
-    return DefWindowProcW(h, msg, wp, lp);
+// Called by the main window whenever the list selection changes.
+void RenameDlgSelectionChanged() {
+    if (g_rnWnd && IsWindow(g_rnWnd)) RnRefresh(g_rnWnd);
 }
 
-void ShowRenameDialog(bool left) {
-    HWND lv = left ? g_llist : g_rlist;
-    std::vector<std::wstring> files;
-    int idx = -1;
-    while ((idx = ListView_GetNextItem(lv, idx, LVNI_SELECTED)) >= 0) {
-        if (idx >= (int)g_vis.size()) break;
-        CmpNode* n = g_vis[idx];
-        if (n->isDir) continue;
-        std::wstring p = left ? n->leftFullPath() : n->rightFullPath();
-        if (!p.empty()) files.push_back(p);
+static void RnApply(HWND d) {
+    RnOpts o = RnReadOpts(d);
+    std::vector<std::wstring> files = RnCollect(d);
+    int total = (int)files.size();
+    if (!total) {
+        MessageBoxW(d, L"Select one or more files in the main window first.", L"Rename", MB_OK | MB_ICONINFORMATION);
+        return;
     }
-    if (files.empty()) { MessageBoxW(g_wnd, L"Select one or more files first.", L"Rename", MB_OK | MB_ICONINFORMATION); return; }
-
-    static bool reg = false;
-    if (!reg) {
-        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = RenameDlgProc; wc.hInstance = g_inst;
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = g_brBg ? g_brBg : (HBRUSH)GetStockObject(BLACK_BRUSH);
-        wc.lpszClassName = L"FCRenameDlg";
-        RegisterClassExW(&wc); reg = true;
-    }
-    RnDlg st; st.files = &files;
-    const int W = 310, H = 404;
-    RECT pr; GetWindowRect(g_wnd, &pr);
-    RECT rc = {0, 0, W, H};
-    AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU | WS_POPUP, FALSE);
-    int ww = rc.right - rc.left, hh = rc.bottom - rc.top;
-    HWND d = CreateWindowExW(WS_EX_DLGMODALFRAME, L"FCRenameDlg", L"Rename Files",
-        WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
-        (pr.left + pr.right - ww) / 2, (pr.top + pr.bottom - hh) / 2, ww, hh,
-        g_wnd, nullptr, g_inst, &st);
-    if (!d) return;
-    st.wnd = d;
-    ApplyImmersiveDarkMode(d);
-    HFONT f = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-
-    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0) {
-        HWND c = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | style, x, y, w, h, d, (HMENU)(INT_PTR)id, g_inst, nullptr);
-        SendMessage(c, WM_SETFONT, (WPARAM)f, TRUE);
-        return c;
-    };
-    auto check = [&](const wchar_t* t, int y, int id) {
-        HWND c = mk(L"BUTTON", t, BS_AUTOCHECKBOX | WS_TABSTOP, 14, y, 120, 22, id);
-        SetWindowTheme(c, L"", L"");
-        return c;
-    };
-    auto edit = [&](int x, int y, int w, int id, bool num) {
-        return mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP | (num ? ES_NUMBER : 0), x, y, w, 22, id, WS_EX_CLIENTEDGE);
-    };
-    auto spin = [&](int editId, int udId, int lo, int hi, int pos) {
-        HWND u = CreateWindowExW(0, UPDOWN_CLASSW, nullptr,
-            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
-            0, 0, 0, 0, d, (HMENU)(INT_PTR)udId, g_inst, nullptr);
-        SendMessage(u, UDM_SETBUDDY, (WPARAM)GetDlgItem(d, editId), 0);
-        SendMessage(u, UDM_SETRANGE32, lo, hi);
-        SendMessage(u, UDM_SETPOS32, 0, pos);
-    };
-
-    int y = 14;
-    check(L"Base Name:", y, RN_BASE_CK); edit(140, y, 154, RN_BASE_ED, false); y += 34;
-    check(L"Prefix:",    y, RN_PRE_CK);  edit(140, y, 154, RN_PRE_ED, false);  y += 34;
-    check(L"Remove First:", y, RN_RF_CK); edit(140, y, 60, RN_RF_ED, true); spin(RN_RF_ED, RN_RF_UD, 0, 99, 0);
-    mk(L"STATIC", L"chars", 0, 208, y + 3, 80, 20, 0); y += 34;
-    check(L"Suffix:",    y, RN_SUF_CK);  edit(140, y, 154, RN_SUF_ED, false);  y += 34;
-    check(L"Remove Last:", y, RN_RL_CK);  edit(140, y, 60, RN_RL_ED, true); spin(RN_RL_ED, RN_RL_UD, 0, 99, 0);
-    mk(L"STATIC", L"chars", 0, 208, y + 3, 80, 20, 0); y += 40;
-    check(L"Numbered", y, RN_NUM_CK); y += 28;
-    mk(L"STATIC", L"Base Number:", 0, 30, y + 3, 100, 20, 0);
-    edit(140, y, 60, RN_BN_ED, true); spin(RN_BN_ED, RN_BN_UD, 0, 999999, 0); y += 30;
-    mk(L"STATIC", L"Step:", 0, 30, y + 3, 100, 20, 0);
-    edit(140, y, 60, RN_ST_ED, true); spin(RN_ST_ED, RN_ST_UD, 0, 9999, 1); y += 36;
-    mk(L"STATIC", L"", SS_LEFT, 14, y, W - 28, 62, RN_PREVIEW);
-    HWND okb = mk(L"BUTTON", L"Rename", BS_DEFPUSHBUTTON | WS_TABSTOP, 14, H - 44, 180, 30, IDOK);
-    HWND cnb = mk(L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 204, H - 44, 90, 30, IDCANCEL);
-    SetWindowTheme(okb, L"DarkMode_Explorer", nullptr);
-    SetWindowTheme(cnb, L"DarkMode_Explorer", nullptr);
-    for (int id : { RN_BASE_ED, RN_PRE_ED, RN_RF_ED, RN_SUF_ED, RN_RL_ED, RN_BN_ED, RN_ST_ED })
-        SetWindowTheme(GetDlgItem(d, id), L"DarkMode_Explorer", nullptr);
-
-    CheckDlgButton(d, RN_BASE_CK, BST_CHECKED);
-    RnRefresh(d, &st);
-    SetFocus(GetDlgItem(d, RN_BASE_ED));
-
-    EnableWindow(g_wnd, FALSE);
-    MSG m;
-    while (!st.done && GetMessage(&m, nullptr, 0, 0)) {
-        if (!IsDialogMessage(d, &m)) { TranslateMessage(&m); DispatchMessage(&m); }
-    }
-    EnableWindow(g_wnd, TRUE);
-    DestroyWindow(d);
-    SetForegroundWindow(g_wnd);
-    if (!st.ok) return;
-
-    // Apply
-    const RnOpts& o = st.opts;
-    int ok_n = 0, skip = 0, total = (int)files.size();
+    int ok_n = 0, skip = 0;
     std::wstring why;
     auto note = [&](const std::wstring& s) { skip++; AddLog(s); if (skip <= 8) why += L"• " + s + L"\n"; };
     for (int i = 0; i < total; i++) {
@@ -2056,8 +1957,131 @@ void ShowRenameDialog(bool left) {
     if (ok_n) Compare();
     if (skip) {
         std::wstring msg = std::wstring(sum) + L"\n\n" + why;
-        MessageBoxW(g_wnd, msg.c_str(), L"Rename", MB_OK | (ok_n ? MB_ICONINFORMATION : MB_ICONWARNING));
+        MessageBoxW(d, msg.c_str(), L"Rename", MB_OK | (ok_n ? MB_ICONINFORMATION : MB_ICONWARNING));
     }
+    RnRefresh(d);
+}
+
+static LRESULT CALLBACK RenameDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORBTN: {
+        HDC dc = (HDC)wp; HWND c = (HWND)lp;
+        bool en = IsWindowEnabled(c) != 0;
+        SetTextColor(dc, en ? CLR_TEXT : CLR_MUTED);
+        SetBkMode(dc, OPAQUE);
+        if (msg == WM_CTLCOLOREDIT) {
+            SetBkColor(dc, CLR_EDIT);
+            return (LRESULT)(g_brEdit ? g_brEdit : GetStockObject(BLACK_BRUSH));
+        }
+        SetBkColor(dc, CLR_BG);
+        return (LRESULT)(g_brBg ? g_brBg : GetStockObject(BLACK_BRUSH));
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wp), code = HIWORD(wp);
+        if (id == IDOK)     { RnApply(h); return 0; }          // stays open
+        if (id == IDCANCEL) { DestroyWindow(h); return 0; }    // Close / Esc
+        if (code == BN_CLICKED || code == EN_CHANGE) RnRefresh(h);
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        if (h == g_rnWnd) g_rnWnd = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void ShowRenameDialog(bool left) {
+    if (g_rnWnd && IsWindow(g_rnWnd)) {   // already open: just switch side and focus
+        CheckRadioButton(g_rnWnd, RN_SIDE_L, RN_SIDE_R, left ? RN_SIDE_L : RN_SIDE_R);
+        RnRefresh(g_rnWnd);
+        ShowWindow(g_rnWnd, SW_SHOW);
+        SetForegroundWindow(g_rnWnd);
+        return;
+    }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = RenameDlgProc; wc.hInstance = g_inst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_brBg ? g_brBg : (HBRUSH)GetStockObject(BLACK_BRUSH);
+        wc.lpszClassName = L"FCRenameDlg";
+        RegisterClassExW(&wc); reg = true;
+    }
+    const int W = 310, H = 452;
+    RECT pr; GetWindowRect(g_wnd, &pr);
+    RECT rc = {0, 0, W, H};
+    AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU | WS_POPUP, FALSE);
+    int ww = rc.right - rc.left, hh = rc.bottom - rc.top;
+    // Place it at the right edge of the main window so the file lists stay visible.
+    int px = pr.right - ww - 20, py = pr.top + 60;
+    HWND d = CreateWindowExW(WS_EX_TOOLWINDOW, L"FCRenameDlg", L"Rename Files",
+        WS_CAPTION | WS_SYSMENU | WS_POPUP,
+        px, py, ww, hh, g_wnd, nullptr, g_inst, nullptr);
+    if (!d) return;
+    g_rnWnd = d;
+    ApplyImmersiveDarkMode(d);
+    HFONT f = g_uiFont ? g_uiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | style, x, y, w, h, d, (HMENU)(INT_PTR)id, g_inst, nullptr);
+        SendMessage(c, WM_SETFONT, (WPARAM)f, TRUE);
+        return c;
+    };
+    auto check = [&](const wchar_t* t, int y, int id, DWORD st = BS_AUTOCHECKBOX) {
+        HWND c = mk(L"BUTTON", t, st | WS_TABSTOP, 14, y, 120, 22, id);
+        SetWindowTheme(c, L"", L"");
+        return c;
+    };
+    auto edit = [&](int x, int y, int w, int id, bool num) {
+        return mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP | (num ? ES_NUMBER : 0), x, y, w, 22, id, WS_EX_CLIENTEDGE);
+    };
+    auto spin = [&](int editId, int udId, int lo, int hi, int pos) {
+        HWND u = CreateWindowExW(0, UPDOWN_CLASSW, nullptr,
+            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
+            0, 0, 0, 0, d, (HMENU)(INT_PTR)udId, g_inst, nullptr);
+        SendMessage(u, UDM_SETBUDDY, (WPARAM)GetDlgItem(d, editId), 0);
+        SendMessage(u, UDM_SETRANGE32, lo, hi);
+        SendMessage(u, UDM_SETPOS32, 0, pos);
+    };
+
+    int y = 12;
+    // Side selector
+    HWND rl = check(L"Left side",  y, RN_SIDE_L, BS_AUTORADIOBUTTON);
+    HWND rr = check(L"Right side", y, RN_SIDE_R, BS_AUTORADIOBUTTON);
+    SetWindowPos(rr, nullptr, 160, y, 120, 22, SWP_NOZORDER);
+    (void)rl;
+    y += 32;
+    check(L"Base Name:", y, RN_BASE_CK); edit(140, y, 154, RN_BASE_ED, false); y += 34;
+    check(L"Prefix:",    y, RN_PRE_CK);  edit(140, y, 154, RN_PRE_ED, false);  y += 34;
+    check(L"Remove First:", y, RN_RF_CK); edit(140, y, 60, RN_RF_ED, true); spin(RN_RF_ED, RN_RF_UD, 0, 99, 0);
+    mk(L"STATIC", L"chars", 0, 208, y + 3, 80, 20, 0); y += 34;
+    check(L"Suffix:",    y, RN_SUF_CK);  edit(140, y, 154, RN_SUF_ED, false);  y += 34;
+    check(L"Remove Last:", y, RN_RL_CK);  edit(140, y, 60, RN_RL_ED, true); spin(RN_RL_ED, RN_RL_UD, 0, 99, 0);
+    mk(L"STATIC", L"chars", 0, 208, y + 3, 80, 20, 0); y += 40;
+    check(L"Numbered", y, RN_NUM_CK); y += 28;
+    mk(L"STATIC", L"Base Number:", 0, 30, y + 3, 100, 20, 0);
+    edit(140, y, 60, RN_BN_ED, true); spin(RN_BN_ED, RN_BN_UD, 0, 999999, 0); y += 30;
+    mk(L"STATIC", L"Step:", 0, 30, y + 3, 100, 20, 0);
+    edit(140, y, 60, RN_ST_ED, true); spin(RN_ST_ED, RN_ST_UD, 0, 9999, 1); y += 36;
+    mk(L"STATIC", L"", SS_LEFT, 14, y, W - 28, 18, RN_COUNT); y += 20;
+    mk(L"STATIC", L"", SS_LEFT, 14, y, W - 28, 62, RN_PREVIEW);
+    HWND okb = mk(L"BUTTON", L"Rename", BS_DEFPUSHBUTTON | WS_TABSTOP, 14, H - 44, 180, 30, IDOK);
+    HWND cnb = mk(L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, 204, H - 44, 90, 30, IDCANCEL);
+    SetWindowTheme(okb, L"DarkMode_Explorer", nullptr);
+    SetWindowTheme(cnb, L"DarkMode_Explorer", nullptr);
+    for (int id : { RN_BASE_ED, RN_PRE_ED, RN_RF_ED, RN_SUF_ED, RN_RL_ED, RN_BN_ED, RN_ST_ED })
+        SetWindowTheme(GetDlgItem(d, id), L"DarkMode_Explorer", nullptr);
+
+    CheckRadioButton(d, RN_SIDE_L, RN_SIDE_R, left ? RN_SIDE_L : RN_SIDE_R);
+    CheckDlgButton(d, RN_BASE_CK, BST_CHECKED);
+    RnRefresh(d);
+    ShowWindow(d, SW_SHOW);
+    SetFocus(GetDlgItem(d, RN_BASE_ED));
 }
 
 // ===================================================================
@@ -3535,6 +3559,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 ListView_SetItemState(other,nlv->iItem,nlv->uNewState,LVIS_SELECTED|LVIS_FOCUSED);
                 g_syncSel=false;
                 UpdateStatusSel();
+                RenameDlgSelectionChanged();
             }
             break;
         }
@@ -3692,6 +3717,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show) {
     while(GetMessage(&m,nullptr,0,0)) {
         HWND f = GetFocus();
         bool inEdit = (f == g_fedit || f == g_lpath || f == g_rpath || f == g_log);
+        if (g_rnWnd && IsWindow(g_rnWnd) && IsDialogMessageW(g_rnWnd, &m)) continue;
         if (inEdit || !g_accel || !TranslateAcceleratorW(g_wnd, g_accel, &m)) {
             if (m.message == WM_KEYDOWN && m.wParam == VK_TAB && IsDialogMessage(g_wnd, &m)) continue;
         TranslateMessage(&m); DispatchMessage(&m);
