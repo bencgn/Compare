@@ -1558,6 +1558,7 @@ static std::wstring MirrorDestDir(const std::wstring& srcBase, std::wstring srcR
     if (_wcsnicmp(srcBase.c_str(), srcRoot.c_str(), srcRoot.size()) != 0) return L"";
     std::wstring rel = srcBase.substr(srcRoot.size());
     if (!rel.empty() && rel[0] != L'\\' && rel[0] != L'/') return L"";
+    while (!rel.empty() && (rel.back() == 0x5C || rel.back() == 0x2F)) rel.pop_back();
     return dstRoot + rel;
 }
 
@@ -3589,13 +3590,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        // Double-click: navigate into folder / open file
+        // Double-click: expand/collapse folder / open file (use context menu "Open Folder" to navigate)
         if(nm->code==NM_DBLCLK && (nm->hwndFrom==g_llist||nm->hwndFrom==g_rlist)) {
             bool isLeft=(nm->hwndFrom==g_llist);
             NMITEMACTIVATE* nia=(NMITEMACTIVATE*)lp;
             if(nia->iItem>=0 && nia->iItem<(int)g_vis.size()) {
                 CmpNode* node=g_vis[nia->iItem];
-                if(node->isDir) NavigateInto(node);
+                if(node->isDir) { if(node->expanded) CollapseNode(node); else ExpandNode(node); }
                 else            OpenFile(isLeft, nia->iItem);
             }
             return 0;
