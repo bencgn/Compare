@@ -118,6 +118,7 @@ namespace fs = std::filesystem;
 #define ID_CTX_OPEN         504
 #define ID_CTX_EXPAND       505
 #define ID_CTX_COLLAPSE     506
+#define ID_CTX_ENTER        507
 // Resize PNG: scale factors 510..515, longest-side presets 520..525
 #define ID_CTX_RS_X05       510
 #define ID_CTX_RS_X2        511
@@ -337,6 +338,7 @@ void SortVis(int col, bool asc);
 void UpdateSortArrow();
 void AddLog(const std::wstring&);
 void NavigateInto(CmpNode* node);
+static std::wstring MirrorDestDir(const std::wstring& srcBase, std::wstring srcRoot, std::wstring dstRoot);
 void NavigateUp();
 void NavigateBack();
 void ExpandNode(CmpNode*);
@@ -1172,9 +1174,36 @@ static void PushNavBack() {
 void NavigateInto(CmpNode* node) {
     if (g_copyInProgress) { AddLog(L"Navigation disabled while copying."); return; }
     if (!node) return;
-    PushNavBack();
+    ReadPathEdits();
     std::wstring lp = node->leftFullPath();
     std::wstring rp = node->rightFullPath();
+    // Folder exists on one side only: enter the same-named folder on the other side too,
+    // so both sides stay aligned (offer to create it).
+    bool missL = lp.empty(), missR = rp.empty();
+    if (missL && !node->rightBase.empty()) {
+        std::wstring b = MirrorDestDir(node->rightBase, g_rpathStr, g_lpathStr);
+        if (!b.empty()) lp = b + L'\\' + node->name;
+    }
+    if (missR && !node->leftBase.empty()) {
+        std::wstring b = MirrorDestDir(node->leftBase, g_lpathStr, g_rpathStr);
+        if (!b.empty()) rp = b + L'\\' + node->name;
+    }
+    for (int side = 0; side < 2; side++) {
+        bool miss = side == 0 ? missL : missR;
+        const std::wstring& pth = side == 0 ? lp : rp;
+        if (!miss || pth.empty() || GetFileAttributesW(pth.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        std::wstring q = std::wstring(side == 0 ? L"Left" : L"Right") + L" side has no folder:\n\n" + pth + L"\n\nCreate it and enter?";
+        if (MessageBoxW(g_wnd, q.c_str(), L"Open folder", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        std::error_code ec;
+        fs::create_directories(fs::path(pth), ec);
+        if (ec || GetFileAttributesW(pth.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            std::wstring em = L"Could not create folder:\n\n" + pth;
+            MessageBoxW(g_wnd, em.c_str(), L"Open folder", MB_OK | MB_ICONERROR);
+            return;
+        }
+        AddLog(L"Created folder: " + pth);
+    }
+    PushNavBack();
     if (!lp.empty()) { g_lpathStr = lp; SetWindowTextW(g_lpath, lp.c_str()); }
     if (!rp.empty()) { g_rpathStr = rp; SetWindowTextW(g_rpath, rp.c_str()); }
     Compare();
@@ -3617,6 +3646,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             isLeft?L"Delete from Left (Recycle Bin)":L"Delete from Right (Recycle Bin)");
         if(node&&node->isDir) {
             AppendMenuW(hm,MF_SEPARATOR,0,nullptr);
+            AppendMenuW(hm,MF_STRING,ID_CTX_ENTER,L"Open Folder (compare inside)");
             AppendMenuW(hm,MF_STRING|(node->expanded?MF_GRAYED:0),ID_CTX_EXPAND,   L"Expand Tree");
             AppendMenuW(hm,MF_STRING|(node->expanded?0:MF_GRAYED),ID_CTX_COLLAPSE, L"Collapse Tree");
         }
@@ -3652,6 +3682,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_CTX_DEL:     DeleteSelected(isLeft); break;
         case ID_CTX_EXPLORE: OpenInExplorer(isLeft,idx); break;
         case ID_CTX_OPEN:    OpenFile(isLeft,idx); break;
+        case ID_CTX_ENTER:   if(node) NavigateInto(node); break;
         case ID_CTX_EXPAND:  if(node) ExpandNode(node);   break;
         case ID_CTX_COLLAPSE:if(node) CollapseNode(node); break;
         case ID_CTX_RENAME:  ShowRenameDialog(isLeft); break;
