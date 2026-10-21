@@ -927,6 +927,24 @@ void Compare() {
         SetFocus(left.empty() ? g_lpath : g_rpath);
         return;
     }
+    // If a typed/pasted path does not exist yet, offer to create it.
+    for (int side = 0; side < 2; side++) {
+        const std::wstring& pth = side == 0 ? left : right;
+        if (GetFileAttributesW(pth.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+        std::wstring q = std::wstring(side == 0 ? L"Left" : L"Right") + L" folder does not exist:\n\n" + pth + L"\n\nCreate it?";
+        if (MessageBoxW(g_wnd, q.c_str(), L"Folder not found", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+            SetStatusTextPart(0, L"  Folder not found");
+            return;
+        }
+        std::error_code ec;
+        fs::create_directories(fs::path(pth), ec);
+        if (ec || GetFileAttributesW(pth.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            std::wstring em = L"Could not create folder:\n\n" + pth;
+            MessageBoxW(g_wnd, em.c_str(), L"Create folder", MB_OK | MB_ICONERROR);
+            return;
+        }
+        AddLog(L"Created folder: " + pth);
+    }
     wchar_t fbuf[512] = {};
     GetWindowTextW(g_fedit, fbuf, 512);
     g_filterPattern = Trim(fbuf);
@@ -1501,6 +1519,19 @@ static void BackgroundCopyThread(CopyJob job) {
     PostMessageW(g_wnd, WM_COPY_STATE, 0, 0); // Finished
 }
 
+// When the destination side has no such folder yet (item lives in a folder that only
+// exists on the source side), rebuild the same relative path under the destination root.
+// The folder chain itself is created by the copy (create_directories).
+static std::wstring MirrorDestDir(const std::wstring& srcBase, std::wstring srcRoot, std::wstring dstRoot) {
+    while (!srcRoot.empty() && (srcRoot.back() == L'\\' || srcRoot.back() == L'/')) srcRoot.pop_back();
+    while (!dstRoot.empty() && (dstRoot.back() == L'\\' || dstRoot.back() == L'/')) dstRoot.pop_back();
+    if (srcRoot.empty() || dstRoot.empty() || srcBase.size() < srcRoot.size()) return L"";
+    if (_wcsnicmp(srcBase.c_str(), srcRoot.c_str(), srcRoot.size()) != 0) return L"";
+    std::wstring rel = srcBase.substr(srcRoot.size());
+    if (!rel.empty() && rel[0] != L'\\' && rel[0] != L'/') return L"";
+    return dstRoot + rel;
+}
+
 void CopySelected(bool leftToRight, bool refresh) {
     if (g_copyInProgress) {
         MessageBoxW(g_wnd, L"A copy operation is already in progress.", L"Copy", MB_ICONWARNING);
@@ -1528,16 +1559,17 @@ void CopySelected(bool leftToRight, bool refresh) {
         CmpNode* node = g_vis[idx];
         std::wstring src, destDir, name;
         if (leftToRight) {
-            if (!node->hasLeft || node->rightBase.empty()) continue;
+            if (!node->hasLeft) continue;
             name = node->leftEntry.name;
             src = node->leftBase + L'\\' + name;
-            destDir = node->rightBase;
+            destDir = node->rightBase.empty() ? MirrorDestDir(node->leftBase, g_lpathStr, g_rpathStr) : node->rightBase;
         } else {
-            if (!node->hasRight || node->leftBase.empty()) continue;
+            if (!node->hasRight) continue;
             name = node->rightEntry.name;
             src = node->rightBase + L'\\' + name;
-            destDir = node->leftBase;
+            destDir = node->leftBase.empty() ? MirrorDestDir(node->rightBase, g_rpathStr, g_lpathStr) : node->leftBase;
         }
+        if (destDir.empty()) continue;
         items.push_back({src, destDir});
         total++;
     }
