@@ -133,6 +133,11 @@ namespace fs = std::filesystem;
 // Layout
 #define TB_H        30
 #define TAB_H       24
+#define TABBAR_H    28
+#define ID_TAB_NEW   600
+#define ID_TAB_CLOSE 601
+#define ID_TAB_NEXT  602
+#define ID_TAB_PREV  603
 #define FILT_H      26
 #define PATH_H      28
 #define HDR_H       24
@@ -224,6 +229,15 @@ std::wstring  g_lpathStr, g_rpathStr;
 std::wstring  g_homeLeft, g_homeRight;
 std::wstring  g_filterPattern = L"*.*";
 std::vector<std::pair<std::wstring, std::wstring>> g_navBack;
+HWND g_tabbar = nullptr;
+static void TabsSaveIni(const std::wstring& cfg);
+static void TabsLoadIni(const std::wstring& cfg);
+void TabsInit();
+void TabsSyncCurrent();
+void TabsNew();
+void TabsCloseCurrent();
+void TabsNext(int dir);
+void CreateTabBar(HWND parent);
 std::vector<std::unique_ptr<CmpNode>> g_roots;  // top-level tree nodes
 std::vector<CmpNode*>                  g_vis;   // flattened visible list
 
@@ -730,6 +744,7 @@ void SaveConfig() {
         wchar_t cw[16]; swprintf(cw, 16, L"%d", g_colW[i]);
         WritePrivateProfileStringW(L"Layout", colKeys[i], cw, cfg.c_str());
     }
+    TabsSaveIni(cfg);
 }
 
 void LoadConfig() {
@@ -752,6 +767,7 @@ void LoadConfig() {
         g_colW[i] = GetPrivateProfileIntW(L"Layout", colKeys[i], colDef[i], cfg.c_str());
         if (g_colW[i] < 40) g_colW[i] = colDef[i];
     }
+    TabsLoadIni(cfg);
 }
 
 // ===================================================================
@@ -957,6 +973,7 @@ void Compare() {
         [left, right, result] {
             g_vis.clear(); g_roots = std::move(*result);
             g_lpathStr = left; g_rpathStr = right;
+            TabsSyncCurrent();
             SortVis(g_sortCol, g_sortAsc);
             int counts[4] = {};
             for (auto& node : g_roots) ++counts[node->status];
@@ -2780,6 +2797,7 @@ void BuildControls(HWND h) {
     g_tab = CreateWindowEx(0,L"STATIC",L"Folder Compare",WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,
         0,0,0,0,h,(HMENU)IDC_TAB,g_inst,nullptr);
     SendMessage(g_tab,WM_SETFONT,(WPARAM)fnt,TRUE);
+    CreateTabBar(h);
 
     // Filter row
     g_flbl  = CreateWindowEx(0,L"STATIC",L"Filters:",WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,0,0,0,0,h,(HMENU)IDC_FLBL,g_inst,nullptr);
@@ -2895,6 +2913,7 @@ void BuildControls(HWND h) {
     if (!g_lpathStr.empty()) SetWindowTextW(g_lpath, g_lpathStr.c_str());
     if (!g_rpathStr.empty()) SetWindowTextW(g_rpath, g_rpathStr.c_str());
     SetWindowTextW(g_fedit, g_filterPattern.c_str());
+    TabsInit();
     UpdateStatusSel();
 }
 
@@ -2915,6 +2934,8 @@ void Layout(HWND h) {
     int y=tbh+2;
 
     ShowWindow(g_tab, SW_HIDE);
+    SetWindowPos(g_tabbar,nullptr,0,y,W,TABBAR_H,SWP_NOZORDER);
+    y+=TABBAR_H;
     int fy=y+GAP;
     SetWindowPos(g_flbl, nullptr,8,fy,44,FILT_H,SWP_NOZORDER);
     SetWindowPos(g_fedit,nullptr,54,fy,std::min(320,W-280),FILT_H,SWP_NOZORDER);
@@ -2952,6 +2973,426 @@ void Layout(HWND h) {
     SetWindowPos(g_log,     nullptr,0,y,W,logHeight,          SWP_NOZORDER);
 
     SetStatusPartsForWidth(W);
+}
+
+// ===================================================================
+// Browser-style tabs
+//   * every tab = one compare session (left, right, filter, own Back history)
+//   * title is generated from the two folder names
+//   * closed tabs go to History (persisted); click one to reopen it
+// ===================================================================
+struct TabState {
+    std::wstring left, right, filter;
+    std::vector<std::pair<std::wstring, std::wstring>> navBack;   // this tab's Back history
+};
+struct ClosedTab { std::wstring left, right, filter; };
+
+static std::vector<TabState>  g_tabs;
+static int                    g_curTab = 0;
+static std::vector<ClosedTab> g_tabHistory;       // most recent first
+static const size_t           TAB_HISTORY_MAX = 50;
+
+static std::wstring TabSeg(std::wstring p) {
+    while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+    if (p.empty()) return L"";
+    size_t s = p.find_last_of(L"\\/");
+    std::wstring seg = (s == std::wstring::npos) ? p : p.substr(s + 1);
+    if (seg.empty() || (seg.size() == 2 && seg[1] == L':')) return p;   // drive root
+    return seg;
+}
+
+static std::wstring TabTitle(const std::wstring& l, const std::wstring& r) {
+    std::wstring a = TabSeg(l), b = TabSeg(r);
+    if (a.empty() && b.empty()) return L"New tab";
+    if (b.empty()) return a;
+    if (a.empty()) return b;
+    if (_wcsicmp(a.c_str(), b.c_str()) == 0) return a;
+    return a + L"  ↔  " + b;
+}
+
+static std::wstring ReadEdit(HWND e) {
+    if (!e || !IsWindow(e)) return L"";
+    wchar_t buf[2048] = {};
+    GetWindowTextW(e, buf, 2048);
+    std::wstring s = buf;
+    size_t a = s.find_first_not_of(L" \t\r\n"), b = s.find_last_not_of(L" \t\r\n");
+    return a == std::wstring::npos ? L"" : s.substr(a, b - a + 1);
+}
+
+// Copy what is currently on screen into the active tab.
+static void TabSaveCurrent() {
+    if (g_curTab < 0 || g_curTab >= (int)g_tabs.size()) return;
+    TabState& t = g_tabs[g_curTab];
+    if (g_lpath && IsWindow(g_lpath)) { t.left = ReadEdit(g_lpath); t.right = ReadEdit(g_rpath); t.filter = ReadEdit(g_fedit); }
+    t.navBack = g_navBack;
+}
+
+static void TabRedraw() { if (g_tabbar && IsWindow(g_tabbar)) InvalidateRect(g_tabbar, nullptr, FALSE); }
+
+// Show the active tab's state in the UI (and compare if both folders are set).
+static void TabLoadCurrent() {
+    TabState& t = g_tabs[g_curTab];
+    g_lpathStr = t.left; g_rpathStr = t.right;
+    g_navBack = t.navBack;
+    SetWindowTextW(g_lpath, t.left.c_str());
+    SetWindowTextW(g_rpath, t.right.c_str());
+    SetWindowTextW(g_fedit, t.filter.empty() ? L"*.*" : t.filter.c_str());
+    TabRedraw();
+    if (!t.left.empty() && !t.right.empty()) {
+        Compare();
+    } else {
+        g_roots.clear();
+        SortVis(g_sortCol, g_sortAsc);
+        SetStatusTextPart(0, L"  Choose both folders");
+        SetFocus(t.left.empty() ? g_lpath : g_rpath);
+    }
+}
+
+// Called when a compare finishes: keep the tab in sync (also renames it).
+void TabsSyncCurrent() {
+    if (g_curTab < 0 || g_curTab >= (int)g_tabs.size()) return;
+    TabState& t = g_tabs[g_curTab];
+    t.left = g_lpathStr; t.right = g_rpathStr;
+    t.filter = ReadEdit(g_fedit);
+    t.navBack = g_navBack;
+    TabRedraw();
+}
+
+static bool TabBusy() { return g_scanning || g_copyInProgress; }
+
+static void TabSwitch(int i) {
+    if (i < 0 || i >= (int)g_tabs.size() || i == g_curTab) return;
+    if (TabBusy()) { MessageBeep(MB_ICONWARNING); return; }
+    TabSaveCurrent();
+    g_curTab = i;
+    TabLoadCurrent();
+    SaveConfig();
+}
+
+void TabsNext(int dir) {
+    int n = (int)g_tabs.size();
+    if (n > 1) TabSwitch(((g_curTab + dir) % n + n) % n);
+}
+
+void TabsNew() {
+    if (TabBusy()) { MessageBeep(MB_ICONWARNING); return; }
+    TabSaveCurrent();
+    g_tabs.push_back(TabState());
+    g_curTab = (int)g_tabs.size() - 1;
+    TabLoadCurrent();
+    SaveConfig();
+}
+
+static void TabDuplicate(int i) {
+    if (TabBusy() || i < 0 || i >= (int)g_tabs.size()) return;
+    TabSaveCurrent();
+    TabState copy = g_tabs[i];
+    g_tabs.insert(g_tabs.begin() + i + 1, copy);
+    g_curTab = i + 1;
+    TabLoadCurrent();
+    SaveConfig();
+}
+
+static void HistoryPush(const TabState& t) {
+    if (t.left.empty() && t.right.empty()) return;
+    for (size_t k = 0; k < g_tabHistory.size(); k++)
+        if (_wcsicmp(g_tabHistory[k].left.c_str(), t.left.c_str()) == 0 &&
+            _wcsicmp(g_tabHistory[k].right.c_str(), t.right.c_str()) == 0) { g_tabHistory.erase(g_tabHistory.begin() + k); break; }
+    g_tabHistory.insert(g_tabHistory.begin(), ClosedTab{ t.left, t.right, t.filter });
+    if (g_tabHistory.size() > TAB_HISTORY_MAX) g_tabHistory.resize(TAB_HISTORY_MAX);
+}
+
+static void TabClose(int i) {
+    if (i < 0 || i >= (int)g_tabs.size()) return;
+    if (TabBusy()) { MessageBeep(MB_ICONWARNING); return; }
+    TabSaveCurrent();
+    HistoryPush(g_tabs[i]);
+    bool wasCurrent = (i == g_curTab);
+    g_tabs.erase(g_tabs.begin() + i);
+    if (g_tabs.empty()) { g_tabs.push_back(TabState()); g_curTab = 0; TabLoadCurrent(); }
+    else if (wasCurrent) { g_curTab = std::min(i, (int)g_tabs.size() - 1); TabLoadCurrent(); }
+    else if (i < g_curTab) g_curTab--;
+    TabRedraw();
+    SaveConfig();
+}
+
+void TabsCloseCurrent() { TabClose(g_curTab); }
+
+static void TabCloseOthers(int keep) {
+    if (TabBusy() || keep < 0 || keep >= (int)g_tabs.size()) return;
+    TabSaveCurrent();
+    for (int i = (int)g_tabs.size() - 1; i >= 0; i--) if (i != keep) HistoryPush(g_tabs[i]);
+    TabState k = g_tabs[keep];
+    g_tabs.clear(); g_tabs.push_back(k);
+    g_curTab = 0;
+    TabLoadCurrent();
+    SaveConfig();
+}
+
+static void TabReopen(size_t hi) {
+    if (hi >= g_tabHistory.size() || TabBusy()) return;
+    ClosedTab c = g_tabHistory[hi];
+    g_tabHistory.erase(g_tabHistory.begin() + hi);
+    TabSaveCurrent();
+    // reuse the active tab if it is still blank, otherwise open a new one
+    if (g_tabs[g_curTab].left.empty() && g_tabs[g_curTab].right.empty()) {
+        g_tabs[g_curTab] = TabState();
+    } else {
+        g_tabs.push_back(TabState());
+        g_curTab = (int)g_tabs.size() - 1;
+    }
+    g_tabs[g_curTab].left = c.left; g_tabs[g_curTab].right = c.right; g_tabs[g_curTab].filter = c.filter;
+    TabLoadCurrent();
+    SaveConfig();
+}
+
+// ---- persistence (FolderCompare.ini) ----
+static std::wstring IniGet(const wchar_t* sec, const std::wstring& key, const std::wstring& cfg) {
+    wchar_t buf[2048] = {};
+    GetPrivateProfileStringW(sec, key.c_str(), L"", buf, 2048, cfg.c_str());
+    return buf;
+}
+static void IniPut(const wchar_t* sec, const std::wstring& key, const std::wstring& val, const std::wstring& cfg) {
+    WritePrivateProfileStringW(sec, key.c_str(), val.empty() ? nullptr : val.c_str(), cfg.c_str());
+}
+
+static void TabsSaveIni(const std::wstring& cfg) {
+    if (g_tabs.empty()) return;
+    TabSaveCurrent();
+    WritePrivateProfileStringW(L"Tabs", L"Count", std::to_wstring(g_tabs.size()).c_str(), cfg.c_str());
+    WritePrivateProfileStringW(L"Tabs", L"Active", std::to_wstring(g_curTab).c_str(), cfg.c_str());
+    for (size_t i = 0; i < g_tabs.size(); i++) {
+        std::wstring k = L"T" + std::to_wstring(i);
+        IniPut(L"Tabs", k + L"_L", g_tabs[i].left, cfg);
+        IniPut(L"Tabs", k + L"_R", g_tabs[i].right, cfg);
+        IniPut(L"Tabs", k + L"_F", g_tabs[i].filter, cfg);
+    }
+    WritePrivateProfileStringW(L"TabHistory", L"Count", std::to_wstring(g_tabHistory.size()).c_str(), cfg.c_str());
+    for (size_t i = 0; i < g_tabHistory.size(); i++) {
+        std::wstring k = L"H" + std::to_wstring(i);
+        IniPut(L"TabHistory", k + L"_L", g_tabHistory[i].left, cfg);
+        IniPut(L"TabHistory", k + L"_R", g_tabHistory[i].right, cfg);
+        IniPut(L"TabHistory", k + L"_F", g_tabHistory[i].filter, cfg);
+    }
+}
+
+static void TabsLoadIni(const std::wstring& cfg) {
+    g_tabs.clear(); g_tabHistory.clear();
+    int n = (int)GetPrivateProfileIntW(L"Tabs", L"Count", 0, cfg.c_str());
+    if (n > 40) n = 40;
+    for (int i = 0; i < n; i++) {
+        std::wstring k = L"T" + std::to_wstring(i);
+        TabState t;
+        t.left = IniGet(L"Tabs", k + L"_L", cfg);
+        t.right = IniGet(L"Tabs", k + L"_R", cfg);
+        t.filter = IniGet(L"Tabs", k + L"_F", cfg);
+        g_tabs.push_back(t);
+    }
+    g_curTab = (int)GetPrivateProfileIntW(L"Tabs", L"Active", 0, cfg.c_str());
+    int m = (int)GetPrivateProfileIntW(L"TabHistory", L"Count", 0, cfg.c_str());
+    if (m > (int)TAB_HISTORY_MAX) m = (int)TAB_HISTORY_MAX;
+    for (int i = 0; i < m; i++) {
+        std::wstring k = L"H" + std::to_wstring(i);
+        ClosedTab c;
+        c.left = IniGet(L"TabHistory", k + L"_L", cfg);
+        c.right = IniGet(L"TabHistory", k + L"_R", cfg);
+        c.filter = IniGet(L"TabHistory", k + L"_F", cfg);
+        if (!c.left.empty() || !c.right.empty()) g_tabHistory.push_back(c);
+    }
+}
+
+// Called once after LoadConfig: make sure there is at least one tab and show it.
+void TabsInit() {
+    if (g_tabs.empty()) {   // first run / old ini: start from the saved Left/Right paths
+        TabState t; t.left = g_lpathStr; t.right = g_rpathStr; t.filter = g_filterPattern;
+        g_tabs.push_back(t); g_curTab = 0;
+    }
+    if (g_curTab < 0 || g_curTab >= (int)g_tabs.size()) g_curTab = 0;
+    TabState& t = g_tabs[g_curTab];
+    g_lpathStr = t.left; g_rpathStr = t.right;
+    SetWindowTextW(g_lpath, t.left.c_str());
+    SetWindowTextW(g_rpath, t.right.c_str());
+    SetWindowTextW(g_fedit, t.filter.empty() ? L"*.*" : t.filter.c_str());
+    TabRedraw();
+}
+
+// ---- tab bar window ----
+#define TB_PLUS_W   30
+#define TB_HIST_W   84
+#define TAB_MIN_W   70
+#define TAB_MAX_W   230
+#define TAB_X_W     22
+
+struct TabGeom { std::vector<RECT> tabs; RECT plus, hist; };
+
+static TabGeom TabGeometry(int W, int H) {
+    TabGeom g;
+    int n = (int)g_tabs.size();
+    int avail = W - TB_PLUS_W - TB_HIST_W - 6;
+    int tw = n ? avail / n : TAB_MAX_W;
+    if (tw > TAB_MAX_W) tw = TAB_MAX_W;
+    if (tw < TAB_MIN_W) tw = TAB_MIN_W;
+    int x = 2;
+    for (int i = 0; i < n; i++) { g.tabs.push_back(RECT{ x, 3, x + tw, H }); x += tw; }
+    g.plus = RECT{ x + 2, 3, x + 2 + TB_PLUS_W, H - 1 };
+    g.hist = RECT{ W - TB_HIST_W - 2, 3, W - 2, H - 1 };
+    return g;
+}
+
+static int g_tabHover = -1;       // tab under the mouse
+static bool g_tabHoverX = false;  // ... and the mouse is over its close button
+static int g_tabHoverBtn = 0;     // 1 = plus, 2 = history
+
+static RECT TabCloseRect(const RECT& r) { return RECT{ r.right - TAB_X_W - 2, r.top + 4, r.right - 4, r.bottom - 4 }; }
+
+static void TabPaint(HWND h) {
+    PAINTSTRUCT ps; HDC wdc = BeginPaint(h, &ps);
+    RECT rc; GetClientRect(h, &rc);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
+    HBITMAP old = (HBITMAP)SelectObject(dc, bmp);
+    HBRUSH bgb = CreateSolidBrush(RGB(6, 6, 6)); FillRect(dc, &rc, bgb); DeleteObject(bgb);
+    SelectObject(dc, g_uiFont ? g_uiFont : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+    TabGeom g = TabGeometry(rc.right, rc.bottom);
+    for (int i = 0; i < (int)g.tabs.size(); i++) {
+        RECT r = g.tabs[i];
+        bool act = (i == g_curTab), hov = (i == g_tabHover);
+        COLORREF bg = act ? RGB(34, 36, 44) : (hov ? RGB(22, 22, 26) : RGB(13, 13, 13));
+        HBRUSH b = CreateSolidBrush(bg); FillRect(dc, &r, b); DeleteObject(b);
+        if (act) { RECT a = { r.left, r.top, r.right, r.top + 2 }; HBRUSH ab = CreateSolidBrush(RGB(86, 140, 230)); FillRect(dc, &a, ab); DeleteObject(ab); }
+        RECT sep = { r.right - 1, r.top + 4, r.right, r.bottom - 4 };
+        HBRUSH sb = CreateSolidBrush(CLR_BORDER); FillRect(dc, &sep, sb); DeleteObject(sb);
+
+        std::wstring title = TabTitle(g_tabs[i].left, g_tabs[i].right);
+        RECT tr = { r.left + 10, r.top, r.right - TAB_X_W - 6, r.bottom };
+        SetTextColor(dc, act ? CLR_TEXT : CLR_MUTED);
+        DrawTextW(dc, title.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+        if (act || hov) {
+            RECT x = TabCloseRect(r);
+            if (i == g_tabHover && g_tabHoverX) { HBRUSH xb = CreateSolidBrush(RGB(120, 50, 50)); FillRect(dc, &x, xb); DeleteObject(xb); }
+            SetTextColor(dc, CLR_TEXT);
+            DrawTextW(dc, L"×", -1, &x, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        }
+    }
+    // "+" and "History" buttons
+    struct { RECT r; const wchar_t* t; int id; } btns[] = { { g.plus, L"+", 1 }, { g.hist, L"History ▼", 2 } };
+    for (auto& bt : btns) {
+        COLORREF bg = (g_tabHoverBtn == bt.id) ? RGB(34, 36, 44) : RGB(13, 13, 13);
+        HBRUSH b = CreateSolidBrush(bg); FillRect(dc, &bt.r, b); DeleteObject(b);
+        SetTextColor(dc, CLR_TEXT);
+        RECT t = bt.r;
+        DrawTextW(dc, bt.t, -1, &t, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    }
+    BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, old); DeleteObject(bmp); DeleteDC(dc);
+    EndPaint(h, &ps);
+}
+
+enum { TABHIT_NONE, TABHIT_TAB, TABHIT_CLOSE, TABHIT_PLUS, TABHIT_HIST };
+static int TabHitTest(HWND h, int x, int y, int* idx) {
+    RECT rc; GetClientRect(h, &rc);
+    TabGeom g = TabGeometry(rc.right, rc.bottom);
+    POINT p = { x, y };
+    *idx = -1;
+    if (PtInRect(&g.plus, p)) return TABHIT_PLUS;
+    if (PtInRect(&g.hist, p)) return TABHIT_HIST;
+    for (int i = 0; i < (int)g.tabs.size(); i++)
+        if (PtInRect(&g.tabs[i], p)) {
+            *idx = i;
+            RECT xr = TabCloseRect(g.tabs[i]);
+            bool showX = (i == g_curTab) || (i == g_tabHover);
+            return (showX && PtInRect(&xr, p)) ? TABHIT_CLOSE : TABHIT_TAB;
+        }
+    return TABHIT_NONE;
+}
+
+static void ShowHistoryMenu(HWND h) {
+    HMENU m = CreatePopupMenu();
+    if (g_tabHistory.empty()) {
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(no closed tabs yet)");
+    } else {
+        for (size_t i = 0; i < g_tabHistory.size(); i++) {
+            const ClosedTab& c = g_tabHistory[i];
+            std::wstring t = TabTitle(c.left, c.right) + L"     —  " + c.left + L"  |  " + c.right;
+            if (t.size() > 110) t = t.substr(0, 107) + L"...";
+            for (size_t p = 0; p < t.size(); p++) if (t[p] == L'&') { t.insert(p, 1, L'&'); p++; }
+            AppendMenuW(m, MF_STRING, 9000 + (UINT)i, t.c_str());
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, 8999, L"Clear history");
+    }
+    RECT rc; GetClientRect(h, &rc);
+    TabGeom g = TabGeometry(rc.right, rc.bottom);
+    POINT pt = { g.hist.right, g.hist.bottom }; ClientToScreen(h, &pt);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+    DestroyMenu(m);
+    if (cmd == 8999) { g_tabHistory.clear(); SaveConfig(); }
+    else if (cmd >= 9000) TabReopen((size_t)(cmd - 9000));
+}
+
+static LRESULT CALLBACK TabBarProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: TabPaint(h); return 0;
+    case WM_MOUSEMOVE: {
+        int idx; int hit = TabHitTest(h, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &idx);
+        int nh = (hit == TABHIT_TAB || hit == TABHIT_CLOSE) ? idx : -1;
+        bool nx = (hit == TABHIT_CLOSE);
+        int nb = hit == TABHIT_PLUS ? 1 : (hit == TABHIT_HIST ? 2 : 0);
+        if (nh != g_tabHover || nx != g_tabHoverX || nb != g_tabHoverBtn) {
+            g_tabHover = nh; g_tabHoverX = nx; g_tabHoverBtn = nb; InvalidateRect(h, nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT te = { sizeof(te), TME_LEAVE, h, 0 }; TrackMouseEvent(&te);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_tabHover = -1; g_tabHoverX = false; g_tabHoverBtn = 0; InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        int idx; int hit = TabHitTest(h, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &idx);
+        if (hit == TABHIT_CLOSE) TabClose(idx);
+        else if (hit == TABHIT_TAB) TabSwitch(idx);
+        else if (hit == TABHIT_PLUS) TabsNew();
+        else if (hit == TABHIT_HIST) ShowHistoryMenu(h);
+        return 0;
+    }
+    case WM_MBUTTONUP: {
+        int idx; int hit = TabHitTest(h, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &idx);
+        if (hit == TABHIT_TAB || hit == TABHIT_CLOSE) TabClose(idx);
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        int idx; int hit = TabHitTest(h, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &idx);
+        if (hit != TABHIT_TAB && hit != TABHIT_CLOSE) return 0;
+        HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, 1, L"Duplicate tab");
+        AppendMenuW(m, MF_STRING, 2, L"Close tab");
+        AppendMenuW(m, MF_STRING | (g_tabs.size() > 1 ? 0 : MF_GRAYED), 3, L"Close other tabs");
+        POINT pt; GetCursorPos(&pt);
+        int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+        DestroyMenu(m);
+        if (cmd == 1) TabDuplicate(idx);
+        else if (cmd == 2) TabClose(idx);
+        else if (cmd == 3) TabCloseOthers(idx);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+void CreateTabBar(HWND parent) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = TabBarProc; wc.hInstance = g_inst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"FCTabBar";
+        RegisterClassExW(&wc); reg = true;
+    }
+    g_tabbar = CreateWindowExW(0, L"FCTabBar", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+        0, 0, 0, 0, parent, nullptr, g_inst, nullptr);
 }
 
 // ===================================================================
@@ -3456,6 +3897,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,h,nullptr);
             DestroyMenu(menu); if(command) PostMessage(h,WM_COMMAND,command,0); break;
         }
+        case ID_TAB_NEW:       TabsNew(); break;
+        case ID_TAB_CLOSE:     TabsCloseCurrent(); break;
+        case ID_TAB_NEXT:      TabsNext(1); break;
+        case ID_TAB_PREV:      TabsNext(-1); break;
         case ID_FILE_EXIT:     SendMessage(h,WM_CLOSE,0,0); break;
         case ID_TB_HOME:       GoHome();          break;
         case ID_TB_BACK:       NavigateBack();    break;
@@ -3782,6 +4227,11 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show) {
         HWND f = GetFocus();
         bool inEdit = (f == g_fedit || f == g_lpath || f == g_rpath || f == g_log);
         if (g_rnWnd && IsWindow(g_rnWnd) && IsDialogMessageW(g_rnWnd, &m)) continue;
+        if (m.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) && GetActiveWindow() == g_wnd) {
+            if (m.wParam == 'T') { PostMessage(g_wnd, WM_COMMAND, ID_TAB_NEW, 0); continue; }
+            if (m.wParam == 'W') { PostMessage(g_wnd, WM_COMMAND, ID_TAB_CLOSE, 0); continue; }
+            if (m.wParam == VK_TAB) { PostMessage(g_wnd, WM_COMMAND, (GetKeyState(VK_SHIFT) & 0x8000) ? ID_TAB_PREV : ID_TAB_NEXT, 0); continue; }
+        }
         if (inEdit || !g_accel || !TranslateAcceleratorW(g_wnd, g_accel, &m)) {
             if (m.message == WM_KEYDOWN && m.wParam == VK_TAB && IsDialogMessage(g_wnd, &m)) continue;
         TranslateMessage(&m); DispatchMessage(&m);
