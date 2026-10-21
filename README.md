@@ -11,6 +11,9 @@ A lightweight, dark-themed folder comparison tool for Windows, written in C++ (W
 - Expand / collapse tree, view modes (All, Differences, Same)
 - Copy left → right / right → left, delete to Recycle Bin
 - Drag & drop folders onto either side
+- Copy auto-creates missing parent folders on the target side (like Beyond Compare)
+- Pasting a path that does not exist asks whether to create it
+- Double-click a folder to expand/collapse; right-click → *Open Folder* (or Enter) to compare inside it on both sides
 - Sessions, comparison rules, keyboard shortcuts (F5 refresh, F6 copy, F7 copy back, Ctrl+F find)
 
 ### Image & file tools (right-click menu)
